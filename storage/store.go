@@ -1,14 +1,20 @@
 package storage
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"path"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 
+	"k8s.io/apimachinery/pkg/conversion"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/etcd3"
@@ -17,9 +23,19 @@ import (
 
 // awsBackend implements storage.Interface using aws services.
 type awsBackend struct {
-	s3  *s3.Client
-	sns *sns.Client
-	sqs *sqs.Client
+	s3            s3API
+	sns           *sns.Client
+	sqs           *sqs.Client
+	groupResource schema.GroupResource
+	codec         runtime.Codec
+	pathPrefix    string
+	bucket        string
+}
+
+// s3API is the interface for s3 client.
+type s3API interface {
+	PutObject(ctx context.Context, input *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+	GetObject(ctx context.Context, input *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
 }
 
 // Returns Versioner associated with this interface.
@@ -31,7 +47,34 @@ func (a *awsBackend) Versioner() storage.Versioner {
 // in seconds (0 means forever). If no error is returned and out is not nil, out will be
 // set to the read value from database.
 func (a *awsBackend) Create(ctx context.Context, key string, obj runtime.Object, out runtime.Object, ttl uint64) error {
-	panic("not implemented") // TODO: Implement
+	if version, err := a.Versioner().ObjectResourceVersion(obj); err == nil && version != 0 {
+		return errors.New("resourceVersion should not be set on objects to be created")
+	}
+	if err := a.Versioner().PrepareObjectForStorage(obj); err != nil {
+		return fmt.Errorf("PrepareObjectForStorage failed: %v", err)
+	}
+	data, err := runtime.Encode(a.codec, obj)
+	if err != nil {
+		return err
+	}
+
+	// TODO: support ttl by tagging expiration time for the S3 object.
+	key = a.generateKey(key)
+	_, err = a.s3.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(a.bucket),
+		Key:         aws.String(key),
+		Body:        bytes.NewReader(data),
+		ContentType: aws.String(runtime.ContentTypeJSON),
+	})
+	if err != nil {
+		return err
+	}
+
+	// TODO: manage rev number
+	if out != nil {
+		return decode(a.codec, a.Versioner(), data, out, 1)
+	}
+	return nil
 }
 
 // Delete removes the specified key and returns the value that existed at that spot.
@@ -130,12 +173,38 @@ func (a *awsBackend) Count(key string) (int64, error) {
 	panic("not implemented") // TODO: Implement
 }
 
+// generateKey generates key for the object.
+func (a *awsBackend) generateKey(key string) string {
+	return path.Join(a.pathPrefix, key) + ".json"
+}
+
+// decode decodes value of bytes into object. It will also set the object resource version to rev.
+// On success, objPtr would be set to the object.
+func decode(codec runtime.Codec, versioner storage.Versioner, value []byte, objPtr runtime.Object, rev int64) error {
+	if _, err := conversion.EnforcePtr(objPtr); err != nil {
+		return fmt.Errorf("unable to convert output object to pointer: %v", err)
+	}
+	_, _, err := codec.Decode(value, nil, objPtr)
+	if err != nil {
+		return err
+	}
+	// being unable to set the version does not prevent the object from being extracted
+	if err := versioner.UpdateObject(objPtr, uint64(rev)); err != nil {
+		// klog.Errorf("failed to update object version: %v", err)
+	}
+	return nil
+}
+
 // NewAWSStorage creates a new storage backend based on provided aws config.
-func NewAWSStorage(config aws.Config, c storagebackend.Config, newFunc func() runtime.Object) storage.Interface {
+func NewAWSStorage(config aws.Config, bucket string, c storagebackend.ConfigForResource, newFunc func() runtime.Object) storage.Interface {
 	return &awsBackend{
-		s3:  s3.NewFromConfig(config),
-		sns: sns.NewFromConfig(config),
-		sqs: sqs.NewFromConfig(config),
+		s3:            s3.NewFromConfig(config),
+		sns:           sns.NewFromConfig(config),
+		sqs:           sqs.NewFromConfig(config),
+		groupResource: c.GroupResource,
+		codec:         c.Codec,
+		pathPrefix:    c.Prefix,
+		bucket:        bucket,
 	}
 }
 
