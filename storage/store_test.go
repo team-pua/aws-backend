@@ -63,7 +63,8 @@ func testSetup(t *testing.T) (context.Context, *awsBackend) {
 type fakeS3 struct {
 	putObjOutput        *s3.PutObjectOutput
 	getObjOutput        *s3.GetObjectOutput
-	listObjOutput       *s3.ListObjectVersionsOutput
+	listObjOutput       *s3.ListObjectsOutput
+	listObjVerOutput    *s3.ListObjectVersionsOutput
 	getObjTaggingOutput *s3.GetObjectTaggingOutput
 	putObjTaggingOutput *s3.PutObjectTaggingOutput
 	deleteObjOutput     *s3.DeleteObjectOutput
@@ -71,6 +72,7 @@ type fakeS3 struct {
 	putObjErr        error
 	getObjErr        error
 	listObjErr       error
+	listObjVerErr    error
 	getObjTaggingErr error
 	putObjTaggingErr error
 	deleteObjErr     error
@@ -84,8 +86,12 @@ func (f *fakeS3) GetObject(ctx context.Context, input *s3.GetObjectInput, optFns
 	return f.getObjOutput, f.getObjErr
 }
 
-func (f *fakeS3) ListObjectVersions(ctx context.Context, input *s3.ListObjectVersionsInput, optFns ...func(*s3.Options)) (*s3.ListObjectVersionsOutput, error) {
+func (f *fakeS3) ListObjects(ctx context.Context, input *s3.ListObjectsInput, optFns ...func(*s3.Options)) (*s3.ListObjectsOutput, error) {
 	return f.listObjOutput, f.listObjErr
+}
+
+func (f *fakeS3) ListObjectVersions(ctx context.Context, input *s3.ListObjectVersionsInput, optFns ...func(*s3.Options)) (*s3.ListObjectVersionsOutput, error) {
+	return f.listObjVerOutput, f.listObjVerErr
 }
 
 func (f *fakeS3) GetObjectTagging(ctx context.Context, input *s3.GetObjectTaggingInput, optFns ...func(*s3.Options)) (*s3.GetObjectTaggingOutput, error) {

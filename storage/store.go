@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"path"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -36,6 +37,7 @@ type awsBackend struct {
 type s3API interface {
 	PutObject(ctx context.Context, input *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
 	GetObject(ctx context.Context, input *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
+	ListObjects(ctx context.Context, input *s3.ListObjectsInput, optFns ...func(*s3.Options)) (*s3.ListObjectsOutput, error)
 	ListObjectVersions(ctx context.Context, input *s3.ListObjectVersionsInput, optFns ...func(*s3.Options)) (*s3.ListObjectVersionsOutput, error)
 	GetObjectTagging(ctx context.Context, input *s3.GetObjectTaggingInput, optFns ...func(*s3.Options)) (*s3.GetObjectTaggingOutput, error)
 	PutObjectTagging(ctx context.Context, input *s3.PutObjectTaggingInput, optFns ...func(*s3.Options)) (*s3.PutObjectTaggingOutput, error)
@@ -118,7 +120,32 @@ func (a *awsBackend) WatchList(ctx context.Context, key string, opts storage.Lis
 // The returned contents may be delayed, but it is guaranteed that they will
 // match 'opts.ResourceVersion' according 'opts.ResourceVersionMatch'.
 func (a *awsBackend) Get(ctx context.Context, key string, opts storage.GetOptions, objPtr runtime.Object) error {
-	panic("not implemented") // TODO: Implement
+	listOut, err := a.s3.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+		Bucket: aws.String(a.bucket),
+		Prefix: &key,
+	})
+	latestCommitted, err := getLatestCommittedVersion(ctx, a.s3, a.bucket, key, listOut)
+	if err != nil {
+		return storage.NewKeyNotFoundError(key, 0)
+	}
+	tagSet, err := getObjectTagSet(ctx, a.s3, a.bucket, key, *latestCommitted.VersionId)
+	if err != nil {
+		return err
+	}
+	rev := getRevision(tagSet)
+	data, err := a.s3.GetObject(ctx, &s3.GetObjectInput{
+		Bucket:    aws.String(a.bucket),
+		Key:       aws.String(key),
+		VersionId: latestCommitted.VersionId,
+	})
+	if err != nil {
+		return err
+	}
+	raw, err := ioutil.ReadAll(data.Body)
+	if err != nil {
+		return err
+	}
+	return decode(a.codec, a.Versioner(), raw, objPtr, int64(rev))
 }
 
 // GetToList unmarshals json found at key and opaque it into *List api object
