@@ -31,6 +31,7 @@ type awsBackend struct {
 	codec         runtime.Codec
 	pathPrefix    string
 	bucket        string
+	txn           Txn
 }
 
 // s3API is the interface for s3 client.
@@ -236,6 +237,10 @@ func NewAWSStorage(config aws.Config, bucket string, c storagebackend.ConfigForR
 		codec:         c.Codec,
 		pathPrefix:    c.Prefix,
 		bucket:        bucket,
+		txn: &txn{
+			s3:     s3.NewFromConfig(config),
+			bucket: bucket,
+		},
 	}
 }
 
