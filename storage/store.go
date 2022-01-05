@@ -20,6 +20,7 @@ import (
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/etcd3"
 	"k8s.io/apiserver/pkg/storage/storagebackend"
+	"k8s.io/klog/v2"
 )
 
 // awsBackend implements storage.Interface using aws services.
@@ -242,6 +243,13 @@ func NewAWSStorage(config aws.Config, bucket string, c storagebackend.ConfigForR
 			bucket: bucket,
 		},
 	}
+}
+
+func NewAWSHealthCheck(c storagebackend.Config) (func() error, error) {
+	klog.Info("calling NewAWSHealthCheck")
+	return func() error {
+		return nil
+	}, nil
 }
 
 var _ storage.Interface = &awsBackend{}
