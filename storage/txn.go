@@ -42,6 +42,12 @@ type ObjectState struct {
 	Revision uint64
 }
 
+func NewTxn(bucket string) Txn {
+	return &txn{
+		bucket: bucket,
+	}
+}
+
 func (t *txn) Create(ctx context.Context, key string, value []byte, ttl uint64) (err error) {
 	input := &s3.PutObjectInput{
 		Bucket:      &t.bucket,
