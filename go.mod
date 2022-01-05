@@ -1,4 +1,4 @@
-module github.com/hanlins/aws-backend
+module github.com/team-pua/aws-backend
 
 go 1.16
 
