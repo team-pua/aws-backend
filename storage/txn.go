@@ -29,7 +29,7 @@ const (
 type Txn interface {
 	Create(ctx context.Context, key string, value []byte, ttl uint64) error
 	Delete(ctx context.Context, key string, origRev uint64) (ObjectState, error)
-	Update(ctx context.Context, key string, value []byte, origRev uint64) error
+	Update(ctx context.Context, key string, value []byte, origRev uint64) (state ObjectState, err error)
 }
 
 type txn struct {
@@ -200,8 +200,18 @@ func (t *txn) Delete(ctx context.Context, key string, origRev uint64) (state Obj
 	}, origRev)
 }
 
-func (t *txn) Update(ctx context.Context, key string, value []byte, origRev uint64) error {
-	panic("not implemented") // TODO: Implement
+func (t *txn) Update(ctx context.Context, key string, value []byte, origRev uint64) (state ObjectState, err error) {
+	return t.mutateKey(ctx, key, "Update", func(ctx context.Context) (*string, error) {
+		out, err := t.s3.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: &t.bucket,
+			Key:    &key,
+			Body:   bytes.NewReader(value),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return out.VersionId, nil
+	}, origRev)
 }
 
 var _ Txn = &txn{}
