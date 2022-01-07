@@ -310,6 +310,7 @@ func (a *awsBackend) WatchList(ctx context.Context, key string, opts storage.Lis
 // The returned contents may be delayed, but it is guaranteed that they will
 // match 'opts.ResourceVersion' according 'opts.ResourceVersionMatch'.
 func (a *awsBackend) Get(ctx context.Context, key string, opts storage.GetOptions, objPtr runtime.Object) error {
+	key = a.generateKey(key)
 	listOut, err := a.s3.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
 		Bucket: aws.String(a.bucket),
 		Prefix: &key,
@@ -506,8 +507,146 @@ func appendListItem(v reflect.Value, data []byte, rev uint64, pred storage.Selec
 //       return cur, nil, nil
 //    },
 // )
-func (a *awsBackend) GuaranteedUpdate(ctx context.Context, key string, ptrToType runtime.Object, ignoreNotFound bool, preconditions *storage.Preconditions, tryUpdate storage.UpdateFunc, cachedExistingObject runtime.Object) error {
+func (a *awsBackend) GuaranteedUpdate(ctx context.Context, key string, out runtime.Object, ignoreNotFound bool, preconditions *storage.Preconditions, tryUpdate storage.UpdateFunc, cachedExistingObject runtime.Object) error {
 	panic("not implemented") // TODO: Implement
+	v, err := conversion.EnforcePtr(out)
+	if err != nil {
+		return fmt.Errorf("unable to convert output object to pointer: %v", err)
+	}
+	key = a.generateKey(key)
+
+	getCurrentState := func() (*ObjectState, error) {
+		getResp, revision, err := a.getObjectAndRevision(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		return a.getState(getResp, key, v, false, revision)
+	}
+
+	var origState *ObjectState
+	var origStateIsCurrent bool
+	if cachedExistingObject != nil {
+		origState, err = a.getStateFromObject(cachedExistingObject)
+	} else {
+		origState, err = getCurrentState()
+		origStateIsCurrent = true
+	}
+	if err != nil {
+		return err
+	}
+
+	for {
+		origObject := getRuntimeObj(v, origState.Content)
+		if err := preconditions.Check(key, origObject); err != nil {
+			// If our data is already up to date, return the error
+			if origStateIsCurrent {
+				return err
+			}
+
+			// It's possible we were working with stale data
+			// Actually fetch
+			origState, err = getCurrentState()
+			if err != nil {
+				return err
+			}
+			origStateIsCurrent = true
+			// Retry
+			continue
+		}
+
+		listOut, err := a.s3.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket: aws.String(a.bucket),
+			Prefix: &key,
+		})
+
+		latestCommitted, err := getLatestCommittedVersion(ctx, a.s3, a.bucket, key, listOut)
+		if err != nil {
+			return err
+		}
+
+		// not found
+		if latestCommitted == nil { // no version
+			return storage.NewKeyNotFoundError(key, 0)
+		}
+		tagSet, err := getObjectTagSet(ctx, a.s3, a.bucket, key, *latestCommitted.VersionId)
+		if err != nil {
+			return err
+		}
+		objTTL, err := getTTL(tagSet)
+		if err != nil {
+			return err
+		}
+		// TODO: pass ttl to Update transaction method
+		ret, _, err := a.updateState(origState, origObject, objTTL, tryUpdate)
+		if err != nil {
+			// If our data is already up to date, return the error
+			if origStateIsCurrent {
+				return err
+			}
+
+			// It's possible we were working with stale data
+			// Remember the revision of the potentially stale data and the resulting update error
+			cachedRev := origState.Revision
+			cachedUpdateErr := err
+
+			// Actually fetch
+			origState, err = getCurrentState()
+			if err != nil {
+				return err
+			}
+			origStateIsCurrent = true
+
+			// it turns out our cached data was not stale, return the error
+			if cachedRev == origState.Revision {
+				return cachedUpdateErr
+			}
+
+			// Retry
+			continue
+		}
+
+		data, err := runtime.Encode(a.codec, ret)
+		if err != nil {
+			return err
+		}
+
+		// newData, err := s.transformer.TransformToStorage(data, transformContext)
+		if err != nil {
+			return storage.NewInternalError(err.Error())
+		}
+
+		origState, err = a.txn.Update(ctx, key, data, origState.Revision)
+		if err != nil {
+			return err
+		}
+		if len(origState.Content) == 0 {
+			// getResp := (*clientv3.GetResponse)(txnResp.Responses[0].GetResponseRange())
+			// klog.V(4).Infof("GuaranteedUpdate of %s failed because of a conflict, going to retry", key)
+			origState, err = a.getState(origState.Content, key, v, ignoreNotFound, origState.Revision)
+			if err != nil {
+				return err
+			}
+			origStateIsCurrent = true
+			continue
+		}
+
+		return decode(a.codec, a.Versioner(), data, out, int64(origState.Revision))
+	}
+}
+
+func (a *awsBackend) updateState(st *ObjectState, obj runtime.Object, ttl int64, userUpdate storage.UpdateFunc) (runtime.Object, uint64, error) {
+	ret, ttlPtr, err := userUpdate(obj, storage.ResponseMeta{TTL: ttl, ResourceVersion: st.Revision})
+	if err != nil {
+		return nil, 0, err
+	}
+
+	if err := a.Versioner().PrepareObjectForStorage(ret); err != nil {
+		return nil, 0, fmt.Errorf("PrepareObjectForStorage failed: %v", err)
+	}
+	if ttlPtr != nil {
+		ttl = int64(*ttlPtr)
+	}
+	return ret, uint64(ttl), nil
 }
 
 // Count returns number of different entries under the key (generally being path prefix).

@@ -201,6 +201,7 @@ func (t *txn) Delete(ctx context.Context, key string, origRev uint64) (state *Ob
 }
 
 func (t *txn) Update(ctx context.Context, key string, value []byte, origRev uint64) (state *ObjectState, err error) {
+	// TODO: support update expiration timestamp according to ttl
 	return t.mutateKey(ctx, key, "Update", func(ctx context.Context) (*string, error) {
 		out, err := t.s3.PutObject(ctx, &s3.PutObjectInput{
 			Bucket: &t.bucket,
@@ -283,6 +284,21 @@ func getRevision(tagSet []types.Tag) uint64 {
 		return revision
 	}
 	return 0
+}
+
+// getTTL returns the ttl of the given object.
+func getTTL(tagSet []types.Tag) (int64, error) {
+	for _, tag := range tagSet {
+		if *tag.Key != ttlKey {
+			continue
+		}
+		ttl, err := strconv.ParseInt(*tag.Value, 10, 64)
+		if err != nil {
+			return 0, err
+		}
+		return ttl, nil
+	}
+	return 0, nil
 }
 
 // genRevision generates a revision number.
