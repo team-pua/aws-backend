@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"path"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -202,7 +203,24 @@ func (a *awsBackend) GuaranteedUpdate(ctx context.Context, key string, ptrToType
 
 // Count returns number of different entries under the key (generally being path prefix).
 func (a *awsBackend) Count(key string) (int64, error) {
-	panic("not implemented") // TODO: Implement
+	key = path.Join(a.pathPrefix, key)
+
+	// We need to make sure the key ended with "/" so that we only get children "directories".
+	// e.g. if we have key "/a", "/a/b", "/ab", getting keys with prefix "/a" will return all three,
+	// while with prefix "/a/" will return only "/a/b" which is the correct answer.
+	if !strings.HasSuffix(key, "/") {
+		key += "/"
+	}
+
+	listOut, err := a.s3.ListObjects(context.TODO(), &s3.ListObjectsInput{
+		Bucket: aws.String(a.bucket),
+		Prefix: &key,
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	return int64(len(listOut.Contents)), nil
 }
 
 // generateKey generates key for the object.
