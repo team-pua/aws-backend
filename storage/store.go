@@ -15,6 +15,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/conversion"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -341,7 +343,7 @@ func (a *awsBackend) Get(ctx context.Context, key string, opts storage.GetOption
 // The returned contents may be delayed, but it is guaranteed that they will
 // match 'opts.ResourceVersion' according 'opts.ResourceVersionMatch'.
 func (a *awsBackend) GetToList(ctx context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
-	panic("not implemented") // TODO: Implement
+	return a.list(ctx, key, opts, listObj, false)
 }
 
 // List unmarshalls jsons found at directory defined by key and opaque them
@@ -349,7 +351,128 @@ func (a *awsBackend) GetToList(ctx context.Context, key string, opts storage.Lis
 // The returned contents may be delayed, but it is guaranteed that they will
 // match 'opts.ResourceVersion' according 'opts.ResourceVersionMatch'.
 func (a *awsBackend) List(ctx context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
-	panic("not implemented") // TODO: Implement
+	return a.list(ctx, key, opts, listObj, true)
+}
+
+func (a *awsBackend) list(ctx context.Context, key string, opts storage.ListOptions, listObj runtime.Object, recursive bool) error {
+	pred := opts.Predicate
+	listPtr, err := meta.GetItemsPtr(listObj)
+	if err != nil {
+		return err
+	}
+	v, err := conversion.EnforcePtr(listPtr)
+	if err != nil || v.Kind() != reflect.Slice {
+		return fmt.Errorf("need ptr to slice: %v", err)
+	}
+	key = path.Join(a.pathPrefix, key)
+
+	// For recursive lists, we need to make sure the key ended with "/" so that we only
+	// get children "directories". e.g. if we have key "/a", "/a/b", "/ab", getting keys
+	// with prefix "/a" will return all three, while with prefix "/a/" will return only
+	// "/a/b" which is the correct answer.
+	if recursive && !strings.HasSuffix(key, "/") {
+		key += "/"
+	}
+	keyPrefix := key
+	newItemFunc := getNewItemFunc(listObj, v)
+	var returnedRV int64
+
+	// loop until we have filled the requested limit from etcd or there are no more results
+	var numFetched int
+	var numEvald int
+	for {
+		objListOut, err := a.s3.ListObjects(ctx, &s3.ListObjectsInput{
+			Bucket: aws.String(a.bucket),
+			Prefix: aws.String(keyPrefix),
+		})
+		if err != nil {
+			return err
+		}
+
+		numFetched += len(objListOut.Contents)
+
+		// take items from the response until the bucket is full, filtering as we go
+		for _, s3Obj := range objListOut.Contents {
+			obj, err := a.s3.GetObject(ctx, &s3.GetObjectInput{
+				Bucket: aws.String(a.bucket),
+				Key:    s3Obj.Key,
+			})
+			if err != nil {
+				return err
+			}
+			data, err := ioutil.ReadAll(obj.Body)
+			if err != nil {
+				return err
+			}
+
+			listVerOut, err := a.s3.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+				Bucket: &a.bucket,
+				Prefix: &key,
+			})
+			if err != nil {
+				return err
+			}
+			latestCommitted, err := getLatestCommittedVersion(ctx, a.s3, a.bucket, *s3Obj.Key, listVerOut)
+			if err != nil {
+				return err
+			}
+			tagSet, err := getObjectTagSet(ctx, a.s3, a.bucket, *s3Obj.Key, *latestCommitted.VersionId)
+			if err != nil {
+				return err
+			}
+
+			if err := appendListItem(v, data, getRevision(tagSet), pred, a.codec, a.Versioner(), newItemFunc); err != nil {
+				return err
+			}
+			numEvald++
+		}
+
+		// indicate to the client which resource version was returned
+		if returnedRV == 0 {
+			returnedRV = int64(genRevision())
+		}
+
+		// we're paging but we have filled our bucket
+		if int64(v.Len()) >= pred.Limit {
+			break
+		}
+	}
+
+	// no continuation
+	return a.Versioner().UpdateList(listObj, uint64(returnedRV), "", nil)
+}
+
+func getNewItemFunc(listObj runtime.Object, v reflect.Value) func() runtime.Object {
+	// For unstructured lists with a target group/version, preserve the group/version in the instantiated list items
+	if unstructuredList, isUnstructured := listObj.(*unstructured.UnstructuredList); isUnstructured {
+		if apiVersion := unstructuredList.GetAPIVersion(); len(apiVersion) > 0 {
+			return func() runtime.Object {
+				return &unstructured.Unstructured{Object: map[string]interface{}{"apiVersion": apiVersion}}
+			}
+		}
+	}
+
+	// Otherwise just instantiate an empty item
+	elem := v.Type().Elem()
+	return func() runtime.Object {
+		return reflect.New(elem).Interface().(runtime.Object)
+	}
+}
+
+// appendListItem decodes and appends the object (if it passes filter) to v, which must be a slice.
+func appendListItem(v reflect.Value, data []byte, rev uint64, pred storage.SelectionPredicate, codec runtime.Codec, versioner storage.Versioner, newItemFunc func() runtime.Object) error {
+	obj, _, err := codec.Decode(data, nil, newItemFunc())
+	if err != nil {
+		return err
+	}
+	// being unable to set the version does not prevent the object from being extracted
+	if err := versioner.UpdateObject(obj, rev); err != nil {
+		// klog.Errorf("failed to update object version: %v", err)
+	}
+	if matched, err := pred.Matches(obj); err == nil && matched {
+		v.Set(reflect.Append(v, reflect.ValueOf(obj).Elem()))
+	}
+	return nil
 }
 
 // GuaranteedUpdate keeps calling 'tryUpdate()' to update key 'key' (of type 'ptrToType')
