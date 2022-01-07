@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"path"
+	"reflect"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -34,6 +35,8 @@ type awsBackend struct {
 	bucket        string
 	txn           Txn
 }
+
+type authenticatedDataString string
 
 // s3API is the interface for s3 client.
 type s3API interface {
@@ -91,7 +94,188 @@ func (a *awsBackend) Create(ctx context.Context, key string, obj runtime.Object,
 // current version of the object to avoid read operation from storage to get it.
 // However, the implementations have to retry in case suggestion is stale.
 func (a *awsBackend) Delete(ctx context.Context, key string, out runtime.Object, preconditions *storage.Preconditions, validateDeletion storage.ValidateObjectFunc, cachedExistingObject runtime.Object) error {
-	panic("not implemented") // TODO: Implement
+	v, err := conversion.EnforcePtr(out)
+	if err != nil {
+		return fmt.Errorf("unable to convert output object to pointer: %v", err)
+	}
+	key = a.generateKey(key)
+	return a.conditionalDelete(ctx, key, out, v, preconditions, validateDeletion, cachedExistingObject)
+}
+
+func (a *awsBackend) conditionalDelete(
+	ctx context.Context, key string, out runtime.Object, v reflect.Value, preconditions *storage.Preconditions,
+	validateDeletion storage.ValidateObjectFunc, cachedExistingObject runtime.Object) error {
+	getCurrentState := func() (*ObjectState, error) {
+		getResp, revision, err := a.getObjectAndRevision(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		return a.getState(getResp, key, v, false, revision)
+	}
+
+	var (
+		origState          *ObjectState
+		origStateIsCurrent bool
+		err                error
+	)
+	if cachedExistingObject != nil {
+		origState, err = a.getStateFromObject(cachedExistingObject)
+	} else {
+		origState, err = getCurrentState()
+		origStateIsCurrent = true
+	}
+	if err != nil {
+		return err
+	}
+
+	for {
+		origObject := getRuntimeObj(v, origState.Content)
+		if preconditions != nil {
+			if err := preconditions.Check(key, origObject); err != nil {
+				if origStateIsCurrent {
+					return err
+				}
+
+				// It's possible we're working with stale data.
+				// Remember the revision of the potentially stale data and the resulting update error
+				cachedRev := origState.Revision
+				cachedUpdateErr := err
+
+				// Actually fetch
+				origState, err = getCurrentState()
+				if err != nil {
+					return err
+				}
+				origStateIsCurrent = true
+
+				// it turns out our cached data was not stale, return the error
+				if cachedRev == origState.Revision {
+					return cachedUpdateErr
+				}
+
+				// Retry
+				continue
+			}
+		}
+		if err := validateDeletion(ctx, origObject); err != nil {
+			if origStateIsCurrent {
+				return err
+			}
+
+			// It's possible we're working with stale data.
+			// Remember the revision of the potentially stale data and the resulting update error
+			cachedRev := origState.Revision
+			cachedUpdateErr := err
+
+			// Actually fetch
+			origState, err = getCurrentState()
+			if err != nil {
+				return err
+			}
+			origStateIsCurrent = true
+
+			// it turns out our cached data was not stale, return the error
+			if cachedRev == origState.Revision {
+				return cachedUpdateErr
+			}
+
+			// Retry
+			continue
+		}
+
+		origState, err = a.txn.Delete(ctx, key, origState.Revision)
+		if err != nil {
+			return err
+		}
+		if len(origState.Content) == 0 {
+			origStateIsCurrent = true
+			continue
+		}
+		return decode(a.codec, a.Versioner(), origState.Content, out, int64(origState.Revision))
+	}
+
+	return nil
+}
+
+func getRuntimeObj(v reflect.Value, data []byte) runtime.Object {
+	if u, ok := v.Addr().Interface().(runtime.Unstructured); ok {
+		return u.NewEmptyInstance()
+	}
+	return reflect.New(v.Type()).Interface().(runtime.Object)
+}
+
+func (a *awsBackend) getStateFromObject(obj runtime.Object) (*ObjectState, error) {
+
+	return nil, nil
+}
+
+func (a *awsBackend) getObjectAndRevision(ctx context.Context, key string) ([]byte, uint64, error) {
+	listOut, err := a.s3.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+		Bucket: aws.String(a.bucket),
+		Prefix: &key,
+	})
+
+	latestCommitted, err := getLatestCommittedVersion(ctx, a.s3, a.bucket, key, listOut)
+	if err != nil {
+		return nil, 0, storage.NewKeyNotFoundError(key, 0)
+	}
+
+	// not found
+	if latestCommitted == nil { // no version
+		return nil, 0, nil
+	}
+
+	data, err := a.s3.GetObject(ctx, &s3.GetObjectInput{
+		Bucket:    aws.String(a.bucket),
+		Key:       aws.String(key),
+		VersionId: latestCommitted.VersionId,
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+
+	raw, err := ioutil.ReadAll(data.Body)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	tagSet, err := getObjectTagSet(ctx, a.s3, a.bucket, key, *latestCommitted.VersionId)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	latestRevision := getRevision(tagSet)
+
+	return raw, latestRevision, nil
+}
+
+func (a *awsBackend) getState(getResp []byte, key string, v reflect.Value, ignoreNotFound bool, revision uint64) (*ObjectState, error) {
+	state := &ObjectState{}
+	var obj runtime.Object
+	if u, ok := v.Addr().Interface().(runtime.Unstructured); ok {
+		obj = u.NewEmptyInstance()
+	} else {
+		obj = reflect.New(v.Type()).Interface().(runtime.Object)
+	}
+
+	if len(getResp) == 0 {
+		if !ignoreNotFound {
+			return nil, storage.NewKeyNotFoundError(key, 0)
+		}
+		if err := runtime.SetZeroValue(obj); err != nil {
+			return nil, err
+		}
+		data, err := runtime.Encode(a.codec, obj)
+		if err != nil {
+			return nil, err
+		}
+		state.Content = data
+	} else {
+		state.Content = getResp
+		state.Revision = revision
+	}
+
+	return state, nil
 }
 
 // Watch begins watching the specified key. Events are decoded into API objects,
@@ -103,7 +287,7 @@ func (a *awsBackend) Delete(ctx context.Context, key string, out runtime.Object,
 // and send it in an "ADDED" event, before watch starts.
 func (a *awsBackend) Watch(ctx context.Context, key string, opts storage.ListOptions) (watch.Interface, error) {
 	// TODO: implement watch
-	return &dummyWatch{}, nil
+	return &dummyWatcher{}, nil
 }
 
 // WatchList begins watching the specified key's items. Items are decoded into API
@@ -115,7 +299,7 @@ func (a *awsBackend) Watch(ctx context.Context, key string, opts storage.ListOpt
 // and send them in "ADDED" events, before watch starts.
 func (a *awsBackend) WatchList(ctx context.Context, key string, opts storage.ListOptions) (watch.Interface, error) {
 	// TODO: implement watch
-	return &dummyWatch{}, nil
+	return &dummyWatcher{}, nil
 }
 
 // Get unmarshals json found at key into objPtr. On a not found error, will either

@@ -28,8 +28,8 @@ const (
 // Txn is the interface that wraps mini-transactions.
 type Txn interface {
 	Create(ctx context.Context, key string, value []byte, ttl uint64) error
-	Delete(ctx context.Context, key string, origRev uint64) (ObjectState, error)
-	Update(ctx context.Context, key string, value []byte, origRev uint64) (state ObjectState, err error)
+	Delete(ctx context.Context, key string, origRev uint64) (*ObjectState, error)
+	Update(ctx context.Context, key string, value []byte, origRev uint64) (state *ObjectState, err error)
 }
 
 type txn struct {
@@ -106,32 +106,32 @@ func (t *txn) Create(ctx context.Context, key string, value []byte, ttl uint64) 
 	return nil
 }
 
-func (t *txn) mutateKey(ctx context.Context, key, op string, f func(context.Context) (*string, error), origRev uint64) (state ObjectState, err error) {
+func (t *txn) mutateKey(ctx context.Context, key, op string, f func(context.Context) (*string, error), origRev uint64) (state *ObjectState, err error) {
 	listOut, err := t.s3.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
 		Bucket: &t.bucket,
 		Prefix: &key,
 	})
 	if err != nil {
-		return ObjectState{}, err
+		return nil, err
 	}
 	origLatest := getLatestVersion(listOut)
 	latestCommitted, err := getLatestCommittedVersion(ctx, t.s3, t.bucket, key, listOut)
 	if err != nil {
-		return ObjectState{}, err
+		return nil, err
 	}
 	if origLatest == nil || latestCommitted == nil {
-		return ObjectState{}, storage.NewKeyNotFoundError(key, 0)
+		return nil, storage.NewKeyNotFoundError(key, 0)
 	}
 
 	tagSet, err := getObjectTagSet(ctx, t.s3, t.bucket, key, *latestCommitted.VersionId)
 	if err != nil {
-		return ObjectState{}, err
+		return nil, err
 	}
 
 	if getRevision(tagSet) != origRev {
 		latestRevision := getRevision(tagSet)
 		if latestRevision < origRev {
-			return ObjectState{}, fmt.Errorf("%s: the object's cached revision %v is lower than the latest detected revision %v", op, origRev, latestRevision)
+			return nil, fmt.Errorf("%s: the object's cached revision %v is lower than the latest detected revision %v", op, origRev, latestRevision)
 		}
 		out, err := t.s3.GetObject(ctx, &s3.GetObjectInput{
 			Bucket:    &t.bucket,
@@ -139,18 +139,18 @@ func (t *txn) mutateKey(ctx context.Context, key, op string, f func(context.Cont
 			VersionId: latestCommitted.VersionId,
 		})
 		if err != nil {
-			return ObjectState{}, err
+			return nil, err
 		}
 		content, err := ioutil.ReadAll(out.Body)
 		if err != nil {
-			return ObjectState{}, err
+			return nil, err
 		}
-		return ObjectState{Content: content, Revision: latestRevision}, nil
+		return &ObjectState{Content: content, Revision: latestRevision}, nil
 	}
 
 	opVersion, err := f(ctx)
 	if err != nil {
-		return ObjectState{}, err
+		return nil, err
 	}
 
 	// check if need to revert the deletion
@@ -167,11 +167,11 @@ func (t *txn) mutateKey(ctx context.Context, key, op string, f func(context.Cont
 		VersionIdMarker: opVersion,
 	})
 	if err != nil {
-		return ObjectState{}, err
+		return nil, err
 	}
 	latestAfterOperation := getLatestVersion(listOut)
 	if latestAfterOperation == nil {
-		return ObjectState{}, fmt.Errorf("%s: failed to find the latest version after deletion", op)
+		return nil, fmt.Errorf("%s: failed to find the latest version after deletion", op)
 	}
 	if origLatest.VersionId != latestAfterOperation.VersionId {
 		// some new version added during deletion, revert the deletion operation
@@ -181,13 +181,13 @@ func (t *txn) mutateKey(ctx context.Context, key, op string, f func(context.Cont
 			VersionId: opVersion,
 		})
 		if err != nil {
-			return ObjectState{}, err
+			return nil, err
 		}
 	}
-	return ObjectState{}, nil
+	return nil, nil
 }
 
-func (t *txn) Delete(ctx context.Context, key string, origRev uint64) (state ObjectState, err error) {
+func (t *txn) Delete(ctx context.Context, key string, origRev uint64) (state *ObjectState, err error) {
 	return t.mutateKey(ctx, key, "Delete", func(ctx context.Context) (*string, error) {
 		out, err := t.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
 			Bucket: &t.bucket,
@@ -200,7 +200,7 @@ func (t *txn) Delete(ctx context.Context, key string, origRev uint64) (state Obj
 	}, origRev)
 }
 
-func (t *txn) Update(ctx context.Context, key string, value []byte, origRev uint64) (state ObjectState, err error) {
+func (t *txn) Update(ctx context.Context, key string, value []byte, origRev uint64) (state *ObjectState, err error) {
 	return t.mutateKey(ctx, key, "Update", func(ctx context.Context) (*string, error) {
 		out, err := t.s3.PutObject(ctx, &s3.PutObjectInput{
 			Bucket: &t.bucket,
