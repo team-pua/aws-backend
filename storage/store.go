@@ -102,7 +102,8 @@ func (a *awsBackend) Delete(ctx context.Context, key string, out runtime.Object,
 // If resource version is "0", this interface will get current object at given key
 // and send it in an "ADDED" event, before watch starts.
 func (a *awsBackend) Watch(ctx context.Context, key string, opts storage.ListOptions) (watch.Interface, error) {
-	panic("not implemented") // TODO: Implement
+	// TODO: implement watch
+	return &dummyWatch{}, nil
 }
 
 // WatchList begins watching the specified key's items. Items are decoded into API
@@ -113,7 +114,8 @@ func (a *awsBackend) Watch(ctx context.Context, key string, opts storage.ListOpt
 // If resource version is "0", this interface will list current objects directory defined by key
 // and send them in "ADDED" events, before watch starts.
 func (a *awsBackend) WatchList(ctx context.Context, key string, opts storage.ListOptions) (watch.Interface, error) {
-	panic("not implemented") // TODO: Implement
+	// TODO: implement watch
+	return &dummyWatch{}, nil
 }
 
 // Get unmarshals json found at key into objPtr. On a not found error, will either
