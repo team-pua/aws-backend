@@ -216,6 +216,9 @@ func (a *awsBackend) getObjectAndRevision(ctx context.Context, key string) ([]by
 		Bucket: aws.String(a.bucket),
 		Prefix: &key,
 	})
+	if err != nil {
+		return nil, 0, err
+	}
 
 	latestCommitted, err := getLatestCommittedVersion(ctx, a.s3, a.bucket, key, listOut)
 	if err != nil {
@@ -315,14 +318,20 @@ func (a *awsBackend) Get(ctx context.Context, key string, opts storage.GetOption
 		Bucket: aws.String(a.bucket),
 		Prefix: &key,
 	})
-	latestCommitted, err := getLatestCommittedVersion(ctx, a.s3, a.bucket, key, listOut)
 	if err != nil {
+		return err
+	}
+
+	latestCommitted, err := getLatestCommittedVersion(ctx, a.s3, a.bucket, key, listOut)
+	if err != nil || latestCommitted == nil {
 		return storage.NewKeyNotFoundError(key, 0)
 	}
+
 	tagSet, err := getObjectTagSet(ctx, a.s3, a.bucket, key, *latestCommitted.VersionId)
 	if err != nil {
 		return err
 	}
+
 	rev := getRevision(tagSet)
 	data, err := a.s3.GetObject(ctx, &s3.GetObjectInput{
 		Bucket:    aws.String(a.bucket),
